@@ -203,7 +203,12 @@ struct CachedUnitWithFree {
 };
 
 struct CachedUnitNonRepo {
-  std::shared_ptr<CachedUnitWithFree> cachedUnit;
+  CachedUnitNonRepo() = default;
+  CachedUnitNonRepo(const CachedUnitNonRepo& src){}
+
+  mutable std::shared_ptr<CachedUnitWithFree> cachedUnit;
+
+  mutable SmallLock lock{};
 #ifdef _MSC_VER
   time_t mtime;
 #else
@@ -424,21 +429,21 @@ CachedUnit loadUnitNonRepoAuth(StringData* requestedPath,
   Unit* releaseUnit = nullptr;
   SCOPE_EXIT { if (releaseUnit) delete releaseUnit; };
 
-  auto const updateStatInfo = [&] (NonRepoUnitCache::accessor& acc) {
+  auto const updateStatInfo = [&] (CachedUnitNonRepo& cu) {
     if (statInfo) {
 #ifdef _MSC_VER
-      acc->second.mtime      = statInfo->st_mtime;
+      cu.mtime      = statInfo->st_mtime;
 #else
-      acc->second.mtime      = statInfo->st_mtim;
-      acc->second.ctime      = statInfo->st_ctim;
+      cu.mtime      = statInfo->st_mtim;
+      cu.ctime      = statInfo->st_ctim;
 #endif
-      acc->second.ino        = statInfo->st_ino;
-      acc->second.devId      = statInfo->st_dev;
+      cu.ino        = statInfo->st_ino;
+      cu.devId      = statInfo->st_dev;
     }
   };
 
   auto const cu = [&] () -> CachedUnit {
-    NonRepoUnitCache::accessor rpathAcc;
+    NonRepoUnitCache::const_accessor rpathAcc;
 
     if (!cache.insert(rpathAcc, rpath)) {
       if (!isChanged(rpathAcc->second, statInfo)) {
@@ -450,6 +455,12 @@ CachedUnit loadUnitNonRepoAuth(StringData* requestedPath,
       if (ent) ent->setStr("type", "cache_miss");
     }
 
+    auto const& cuCHM = rpathAcc->second;
+
+    if (cuCHM.cachedUnit != nullptr) return cuCHM.cachedUnit->cu;
+    std::unique_lock<SmallLock> lock(cuCHM.lock);
+    if (cuCHM.cachedUnit != nullptr) return cuCHM.cachedUnit->cu;
+
     /*
      * NB: the new-unit creation path is here, and is done while holding the tbb
      * lock on s_nonRepoUnitCache.  This was originally done deliberately to
@@ -460,7 +471,7 @@ CachedUnit loadUnitNonRepoAuth(StringData* requestedPath,
      * expected to be low contention).
      */
 
-    auto const cu = createUnitFromFile(rpath, &releaseUnit, w, ent,
+    auto cu = createUnitFromFile(rpath, &releaseUnit, w, ent,
                                        nativeFuncs);
 
     // Don't cache the unit if it was created in response to an internal error
@@ -471,16 +482,16 @@ CachedUnit loadUnitNonRepoAuth(StringData* requestedPath,
       return cu;
     }
 
+
     rpathAcc->second.cachedUnit = std::make_shared<CachedUnitWithFree>(cu);
-    updateStatInfo(rpathAcc);
-    return rpathAcc->second.cachedUnit->cu;
+    return cu;
   }();
 
   if (!cu.unit || !cu.unit->isICE()) {
     if (path != rpath) {
       NonRepoUnitCache::accessor pathAcc;
       cache.insert(pathAcc, path);
-      updateStatInfo(pathAcc);
+      updateStatInfo(pathAcc->second);
     }
   }
 
