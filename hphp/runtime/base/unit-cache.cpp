@@ -45,6 +45,7 @@
 #include "hphp/util/timer.h"
 
 #include <cstdlib>
+#include <iostream>
 #include <memory>
 #include <string>
 #include <thread>
@@ -443,23 +444,39 @@ CachedUnit loadUnitNonRepoAuth(StringData* requestedPath,
   };
 
   auto const cu = [&] () -> CachedUnit {
+    std::cout << "Hello!\n";
     NonRepoUnitCache::const_accessor rpathAcc;
 
     if (!cache.insert(rpathAcc, rpath)) {
       if (!isChanged(rpathAcc->second, statInfo)) {
         if (ent) ent->setStr("type", "cache_hit_writelock");
+        std::cout << "Found in " << requestedPath->data() << " in cache and not updated\n";
         return rpathAcc->second.cachedUnit->cu;
       }
+      std::cout << "Found in " << requestedPath->data() << " in cache and stale\n";
       if (ent) ent->setStr("type", "cache_stale");
     } else {
       if (ent) ent->setStr("type", "cache_miss");
+      std::cout << "not Found in " << requestedPath->data() << " in cache\n";
     }
 
     auto const& cuCHM = rpathAcc->second;
+    rpathAcc.release();
 
-    if (cuCHM.cachedUnit != nullptr) return cuCHM.cachedUnit->cu;
+    // Hold the write lock on the unit itself
+    //JAS if (cuCHM.cachedUnit != nullptr) return cuCHM.cachedUnit->cu;
     std::unique_lock<SmallLock> lock(cuCHM.lock);
-    if (cuCHM.cachedUnit != nullptr) return cuCHM.cachedUnit->cu;
+
+    // Add the newly recreated unit to the cache by grabbing a write lock
+    NonRepoUnitCache::accessor acc;
+
+    if (!cache.insert(acc, rpath)) {
+      if ((acc->second.cachedUnit != nullptr) && (!isChanged(acc->second, statInfo))) {
+        if (ent) ent->setStr("type", "cache_hit_writelock");
+        std::cout << "Woke and Found in " << requestedPath->data() << " in cache and updated\n";
+        return acc->second.cachedUnit->cu;
+      }
+    }
 
     /*
      * NB: the new-unit creation path is here, and is done while holding the tbb
@@ -471,6 +488,7 @@ CachedUnit loadUnitNonRepoAuth(StringData* requestedPath,
      * expected to be low contention).
      */
 
+    std::cout << "Created unit for " << requestedPath->data() << "\n";
     auto cu = createUnitFromFile(rpath, &releaseUnit, w, ent,
                                        nativeFuncs);
 
@@ -479,11 +497,14 @@ CachedUnit loadUnitNonRepoAuth(StringData* requestedPath,
     if (UNLIKELY(cu.unit && cu.unit->isICE())) {
       auto const unit = cu.unit;
       Treadmill::enqueue([unit] { delete unit; });
+      std::cout << "Treadmill crazttown? " << requestedPath->data() << "\n";
       return cu;
     }
 
-
-    rpathAcc->second.cachedUnit = std::make_shared<CachedUnitWithFree>(cu);
+    std::cout << "Store unit for " << requestedPath->data() << "\n";
+    acc->second.cachedUnit = std::make_shared<CachedUnitWithFree>(cu);
+    std::cout << "Update TS for " << requestedPath->data() << "\n";
+    updateStatInfo(acc->second);
     return cu;
   }();
 
