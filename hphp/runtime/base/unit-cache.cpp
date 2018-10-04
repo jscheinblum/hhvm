@@ -44,6 +44,7 @@
 #include "hphp/util/struct-log.h"
 #include "hphp/util/timer.h"
 
+#include <chrono>
 #include <cstdlib>
 #include <iostream>
 #include <memory>
@@ -444,39 +445,41 @@ CachedUnit loadUnitNonRepoAuth(StringData* requestedPath,
   };
 
   auto const cu = [&] () -> CachedUnit {
-    std::cout << "Hello!\n";
     NonRepoUnitCache::const_accessor rpathAcc;
 
     if (!cache.insert(rpathAcc, rpath)) {
       if (!isChanged(rpathAcc->second, statInfo)) {
         if (ent) ent->setStr("type", "cache_hit_writelock");
-        std::cout << "Found in " << requestedPath->data() << " in cache and not updated\n";
         return rpathAcc->second.cachedUnit->cu;
       }
-      std::cout << "Found in " << requestedPath->data() << " in cache and stale\n";
       if (ent) ent->setStr("type", "cache_stale");
     } else {
       if (ent) ent->setStr("type", "cache_miss");
-      std::cout << "not Found in " << requestedPath->data() << " in cache\n";
     }
 
     auto const& cuCHM = rpathAcc->second;
     rpathAcc.release();
 
     // Hold the write lock on the unit itself
-    //JAS if (cuCHM.cachedUnit != nullptr) return cuCHM.cachedUnit->cu;
+    auto start = std::chrono::steady_clock::now();
     std::unique_lock<SmallLock> lock(cuCHM.lock);
+    std::cout << "Held lock for: " << std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now()-start).count() << "\n";
 
-    // Add the newly recreated unit to the cache by grabbing a write lock
+    // Add the newly created unit to the cache by grabbing a write lock on the cache
     NonRepoUnitCache::accessor acc;
 
     if (!cache.insert(acc, rpath)) {
-      if ((acc->second.cachedUnit != nullptr) && (!isChanged(acc->second, statInfo))) {
-        if (ent) ent->setStr("type", "cache_hit_writelock");
-        std::cout << "Woke and Found in " << requestedPath->data() << " in cache and updated\n";
-        return acc->second.cachedUnit->cu;
+      // If the element exists after the write lock releases and is
+      // unchanged, return the unit from the cache.
+      if (acc->second.cachedUnit != nullptr) {
+	if (!isChanged(acc->second, statInfo)) {
+          std::cout << "Using newly stored unit for " << requestedPath->data() << "\n";
+          if (ent) ent->setStr("type", "cache_hit_writelock");
+          return acc->second.cachedUnit->cu;
+	}
       }
     }
+    acc.release();
 
     /*
      * NB: the new-unit creation path is here, and is done while holding the tbb
@@ -488,22 +491,19 @@ CachedUnit loadUnitNonRepoAuth(StringData* requestedPath,
      * expected to be low contention).
      */
 
-    std::cout << "Created unit for " << requestedPath->data() << "\n";
-    auto cu = createUnitFromFile(rpath, &releaseUnit, w, ent,
-                                       nativeFuncs);
+    auto cu = createUnitFromFile(rpath, &releaseUnit, w, ent, nativeFuncs);
 
     // Don't cache the unit if it was created in response to an internal error
     // in ExternCompiler. Such units represent transient events.
     if (UNLIKELY(cu.unit && cu.unit->isICE())) {
       auto const unit = cu.unit;
       Treadmill::enqueue([unit] { delete unit; });
-      std::cout << "Treadmill crazttown? " << requestedPath->data() << "\n";
       return cu;
     }
 
+    cache.insert(acc, rpath);
     std::cout << "Store unit for " << requestedPath->data() << "\n";
     acc->second.cachedUnit = std::make_shared<CachedUnitWithFree>(cu);
-    std::cout << "Update TS for " << requestedPath->data() << "\n";
     updateStatInfo(acc->second);
     return cu;
   }();
